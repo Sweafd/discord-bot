@@ -1,49 +1,95 @@
-from discord.ext import commands
+from discord.ext import commands, tasks
 import discord
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 import pytz
-import os
-from dotenv import load_dotenv
 
-load_dotenv()
-BOT_TOKEN = os.getenv('BOT_TOKEN')
-CHANNEL_ID = os.getenv('CHANNEL_ID')
-TIMEZONE = pytz.timezone('America/Chicago')  # CST timezone
+MAX_SESSION_TIME_MINUTES = 30
+CHANNEL_ID = 735326540962725908  # Replace with your actual channel ID
+TIMEZONE = pytz.timezone('America/Chicago')  # Replace with your actual timezone
 
 @dataclass
 class Session:
     is_active: bool = False
-    start_time: int = 0
+    start_time: datetime = None
+    last_reminder_message: discord.Message = None
 
-bot = commands.Bot(command_prefix="!", intents=discord.Intents.all())
-session = Session()
+class SessionCommands(commands.Cog):
+    def __init__(self, bot):
+        self.bot = bot
+        self.session = Session()
+        self.break_reminder.start()
 
-@bot.event
-async def on_ready():
-    print("Hello! bot is ready!")
-    channel = bot.get_channel(CHANNEL_ID)
-    await channel.send("Yo!")
+    def cog_unload(self):
+        self.break_reminder.cancel()
 
-@bot.command()
-async def start(ctx):
-    if session.is_active:
-        await ctx.send("A session is already active!")
-    else:
-        session.is_active = True
-        session.start_time = datetime.now(TIMEZONE).timestamp()
-        human_readable_time = datetime.now(TIMEZONE).strftime("%H:%M:%S")
-        await ctx.send(f"Study session started at {human_readable_time}")
+    @commands.Cog.listener()
+    async def on_ready(self):
+        print("Hello! bot is ready!")
+        channel = self.bot.get_channel(CHANNEL_ID)
+        if channel:
+            await channel.send("Yo!")
 
-@bot.command()
-async def end(ctx):  
-    if not session.is_active:
-        await ctx.send("No session is active!")
-        return
-    
-    session.is_active = False
-    end_time = datetime.now(TIMEZONE).timestamp()
-    duration = end_time - session.start_time
-    await ctx.send(f"Session ended after {duration} seconds")
+    @tasks.loop(minutes=MAX_SESSION_TIME_MINUTES)
+    async def break_reminder(self):
+        channel = self.bot.get_channel(CHANNEL_ID)
+        if channel and self.session.is_active:
+            if self.session.last_reminder_message:
+                await self.session.last_reminder_message.delete()
 
-bot.run(BOT_TOKEN)
+            reminder_message = await channel.send(
+                f'**Take a break!** You\'ve been studying for {MAX_SESSION_TIME_MINUTES} minutes. Use `!time` to check the time remaining.'
+            )
+            self.session.last_reminder_message = reminder_message
+
+    @commands.command()
+    async def start(self, ctx):
+        if self.session.is_active:
+            await ctx.send("A session is already active!")
+        else:
+            self.session.is_active = True
+            self.session.start_time = datetime.now(TIMEZONE)
+            human_readable_time = self.session.start_time.strftime("%H:%M:%S")
+            await ctx.send(f'📚 Study session started at {human_readable_time}. Use `!time` to check the time remaining.')
+
+    @commands.command()
+    async def end(self, ctx):
+        if not self.session.is_active:
+            await ctx.send("No session is active!")
+            return
+
+        if self.session.last_reminder_message:
+            await self.session.last_reminder_message.delete()
+
+        self.session.is_active = False
+        end_time = datetime.now(TIMEZONE)
+        duration = end_time - self.session.start_time
+        await ctx.send(f'🎉 Session ended after {duration}. Great job!')
+
+    @commands.command()
+    async def time(self, ctx):
+        if not self.session.is_active:
+            await ctx.send("No session is currently active.")
+        else:
+            current_time = datetime.now(TIMEZONE)
+            remaining_time = self.session.start_time + timedelta(minutes=MAX_SESSION_TIME_MINUTES) - current_time
+            await ctx.send(f'⏰ Time remaining in the current session: {remaining_time}')
+
+    @start.before_invoke
+    async def before_start(self, ctx):
+        if self.break_reminder.is_running():
+            self.break_reminder.stop()
+
+    @end.before_invoke
+    async def before_end(self, ctx):
+        if self.break_reminder.current_loop == 0:
+            return
+        if not self.break_reminder.is_running():
+            self.break_reminder.start()
+
+    async def on_command_error(self, ctx, error):
+        if isinstance(error, commands.CommandNotFound):
+            return  # Ignore CommandNotFound errors
+
+def setup(bot):
+    bot.add_cog(SessionCommands(bot))
